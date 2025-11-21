@@ -4,43 +4,169 @@ const http = require('http');
 const { Server } = require('socket.io');
 const { OpenAI } = require('openai');
 const { retrieveRelevantHybrid } = require('../lib/retriever');
-const { saveMessage, getRecentMessages } = require('../lib/memory');
+const { saveMessage, getRecentMessages, saveLeadToDb } = require('../lib/memory');
 const { buildMessages } = require('../lib/utils');
 const { OPENAI_API_KEY, PORT } = require('../lib/config');
+const fs = require('fs');
+const path = require('path');
 
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
+const { detectIntentAndEntities } = require('../lib/intent');
 
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: '*' } });
 
+async function saveLeadToFile(lead) {
+  try {
+    const outFile = path.join(__dirname, 'leads.json');
+    let arr = [];
+    if (fs.existsSync(outFile)) {
+      const raw = fs.readFileSync(outFile, 'utf-8') || '[]';
+      arr = JSON.parse(raw);
+    }
+    arr.push({ ...lead, createdAt: new Date().toISOString() });
+    fs.writeFileSync(outFile, JSON.stringify(arr, null, 2), 'utf-8');
+
+
+    return true;
+  } catch (err) {
+    console.error('saveLeadToFile error', err);
+    return false;
+  }
+}
+
+
 io.on('connection', (socket) => {
-  socket.session = { id: socket.id };
+  socket.session = { id: socket.handshake?.auth?.sessionKey };
 
   socket.on('user_message', async (data) => {
     try {
       const text = (data.text || '').trim();
       if (!text) return;
-  
+
       await saveMessage(socket.session.id, 'user', text);
+
+      const classifier = await detectIntentAndEntities(text, await getRecentMessages(socket.session.id, 6));
+
+      if (socket.session.expecting) {
+        socket.session.lead = socket.session.lead || {};
+        const step = socket.session.expecting;
+        // NAME / COMPANY combined step
+        if (step === 'name_company') {
+          socket.session.lead.name_company = text;
+          socket.session.expecting = 'email';
+          socket.emit('bot_message', { _id: `bot-${Date.now()}`, text: 'Thanks — please share your email address.' });
+          return;
+        }
+        if (step === 'email') {
+          const email = text.trim();
+          const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+          if (!emailRegex.test(email)) {
+            socket.emit('bot_message', { _id: `bot-${Date.now()}`, text: 'Please provide a valid email (e.g. you@company.com).' });
+            return;
+          }
+          socket.session.lead.email = email;
+          socket.session.expecting = 'phone';
+          socket.emit('bot_message', { _id: `bot-${Date.now()}`, text: 'Great — could you share your phone number (with country code if possible)?' });
+          return;
+        }
+        if (step === 'phone') {
+          const phone = text.replace(/[^\d+]/g, '');
+          if (phone.length < 7) {
+            socket.emit('bot_message', { _id: `bot-${Date.now()}`, text: 'Phone number looks too short — please re-enter.' });
+            return;
+          }
+          socket.session.lead.phone = phone;
+          socket.session.expecting = 'brief';
+          socket.emit('bot_message', { _id: `bot-${Date.now()}`, text: 'Optional: would you like to share a short project brief?' });
+          return;
+        }
+        if (step === 'brief') {
+          const brief = (text.toLowerCase() === 'no' || text.toLowerCase() === 'n') ? '' : text;
+          socket.session.lead.brief = brief;
+          const lead = {
+            sessionId: socket.session.id,
+            ...socket.session.lead,
+            pageUrl: data.pageUrl || null,
+            source: 'chatbot'
+          };
+          const saved = await saveLeadToDb(lead);
+          socket.session.expecting = null;
+          socket.session.lead = null;
+          if (saved) {
+            socket.emit('bot_message', { _id: `bot-${Date.now()}`, text: 'Thank you! Your details have been saved. Our sales team will contact you shortly.' });
+          } else {
+            socket.emit('bot_message', { _id: `bot-${Date.now()}`, text: 'There was an issue saving your details — please try again.' });
+          }
+          return;
+        }
+        socket.session.expecting = null;
+      }
+
+      if (classifier.intent === 'connect') {
+        socket.session.lead = socket.session.lead || {};
+        Object.assign(socket.session.lead, classifier.entities || {});
+        if (!socket.session.lead.name_company && (classifier.entities.name || classifier.entities.company)) {
+          socket.session.lead.name_company = `${classifier.entities.name || ''} ${classifier.entities.company || ''}`.trim();
+        }
+        console.log('session.lead after merge', socket.session.lead);
   
+        if (!socket.session.lead.email) {
+          socket.session.expecting = 'email';
+          socket.emit('bot_message', { _id: `bot-${Date.now()}`, text: 'Please share your email address.' });
+          return;
+        }
+        if (!socket.session.lead.phone) {
+          socket.session.expecting = 'phone';
+          socket.emit('bot_message', { _id: `bot-${Date.now()}`, text: 'Could you also share your phone number?' });
+          return;
+        }
+        if (!socket.session.lead.brief) {
+          socket.session.expecting = 'brief';
+          socket.emit('bot_message', { _id: `bot-${Date.now()}`, text: 'Would you like to share a short project brief? (optional)' });
+          return;
+        }
+  
+        const lead = {
+          sessionId: socket.session.id,
+          ...socket.session.lead,
+          pageUrl: data.pageUrl || null,
+          source: 'chatbot'
+        };
+        const saved = await saveLeadToDb(lead);
+        socket.session.expecting = null;
+        socket.session.lead = null;
+        if (saved) {
+          socket.emit('bot_message', { _id: `bot-${Date.now()}`, text: 'Thank you! Your details have been saved. Our sales team will contact you shortly.' });
+        } else {
+          socket.emit('bot_message', { _id: `bot-${Date.now()}`, text: 'There was an issue saving your details — please try again.' });
+        }
+        return;
+      }
+
+      const threshold = 0.75;
+      if ((classifier.confidence || 0) < threshold && classifier.clarifying_question) {
+        socket.session.lastClarify = classifier.clarifying_question;
+        socket.emit('bot_message', { _id: `bot-${Date.now()}`, text: classifier.clarifying_question });
+        return;
+      }
+
       let pagePath = null;
       try {
         if (data.pageUrl) pagePath = new URL(data.pageUrl).pathname;
       } catch (e) { pagePath = data.pageUrl; }
-  
+
       const retrieved = await retrieveRelevantHybrid(text, { topK: 8, pageUrl: pagePath });
-      console.log('retrieved', retrieved);
-  
       const recent = await getRecentMessages(socket.session.id, 6);
-  
+
       if (!retrieved || retrieved.length === 0) {
         const fallbackText = "I can't find the exact information on this page. Should I search the entire site or would you like to speak to the team?";
         await saveMessage(socket.session.id, 'assistant', fallbackText);
         socket.emit('bot_message', { _id: `bot-${Date.now()}`, text: fallbackText, sources: [] });
         return;
       }
-  
+
       const systemPrompt = `You are *Algofolks Sales & Solutions Assistant* on the website.
 Your job is to understand the visitor’s needs, guide them using ONLY the provided website context (the “SOURCE” blocks), and gently move them toward starting a conversation or project with the Algofolks team.
 
@@ -117,7 +243,7 @@ Your job is to understand the visitor’s needs, guide them using ONLY the provi
 
 Remember: If at any point you don’t find the needed information in the SOURCE, say:
 *"I don't have exact info on that — shall I connect you to our team?"*`;
-  
+
       const messages = buildMessages({
         systemPrompt,
         recentMessages: recent,
@@ -125,13 +251,13 @@ Remember: If at any point you don’t find the needed information in the SOURCE,
         userQuestion: text,
         maxChunkChars: 1200
       });
-  
+
       let completion;
       const maxRetries = 2;
       for (let attempt = 0; attempt <= maxRetries; attempt++) {
         try {
           completion = await openai.chat.completions.create({
-            model: 'gpt-4o',            
+            model: 'gpt-4o',
             messages,
             temperature: 0.0,
             max_tokens: 600
@@ -143,24 +269,24 @@ Remember: If at any point you don’t find the needed information in the SOURCE,
           await new Promise(r => setTimeout(r, 800 * (attempt + 1)));
         }
       }
-  
+
       let answer = (completion?.choices?.[0]?.message?.content || '').trim();
 
       if (answer.length < 4 || /i don't have exact info/i.test(answer)) {
         // pass through as-is (we want the exact phrase or fallback above already handled)
       }
-  
+
       const sources = Array.from(new Set(retrieved.map(r => r.source).filter(Boolean)));
-  
+
       await saveMessage(socket.session.id, 'assistant', answer);
-  
+
       socket.emit('bot_message', {
         _id: `bot-${Date.now()}`,
         text: answer,
         sources,
         retrieved: retrieved.slice(0, 3).map(r => ({ source: r.source, score: r.score }))
       });
-  
+
     } catch (err) {
       console.error('server error', err);
       socket.emit('bot_message', { _id: `bot-${Date.now()}`, text: "Sorry, Please try again later." });

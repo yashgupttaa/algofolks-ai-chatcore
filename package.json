@@ -17,6 +17,7 @@
     "dotenv": "^17.2.3",
     "express": "^5.1.0",
     "langchain": "^1.0.4",
+    "mongodb": "^7.0.0",
     "openai": "^6.8.1",
     "pdf-parse": "^2.4.5",
     "redis": "^5.9.0",
